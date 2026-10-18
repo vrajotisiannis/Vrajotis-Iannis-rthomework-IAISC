@@ -25,8 +25,7 @@ public class DeviceSimulator {
 
         TemperatureSensor sensor = new TemperatureSensor();
 
-        MqttConnection mqtt = new MqttConnection(Config.STUDENT + "-" + deviceId);
-        mqtt.connect();
+        MqttConnection mqtt = new MqttConnection(Config.STUDENT + "-" + deviceId);mqtt.connect();
 
         // cozile prin care comunică taskurile
         BlockingQueue<Double> alarmEvents = new LinkedBlockingQueue<>();
