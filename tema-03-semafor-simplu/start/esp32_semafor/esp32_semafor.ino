@@ -24,7 +24,11 @@
 
 #include "config.h"
 #include "connection.h"
-
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <string.h>
 // Fazele semaforului (vezi tabelul și diagrama din README.md). Numele din
 // PHASE_NAMES sunt cele din mesajul "lights", în aceeași ordine ca în enum.
 enum Phase { CAR_GREEN, CAR_YELLOW, ALL_RED, PED_GREEN };
@@ -44,7 +48,20 @@ const char* const LIGHT_NAMES[] = {"RED", "YELLOW", "GREEN"};
 //   Mutexul se ține cât mai puțin: în el doar citiți sau scrieți câmpurile
 //   (eventual copiați starea într-o variabilă locală). Fără mqtt_publish(),
 //   Serial sau așteptări cât timp țineți mutexul.
+// Starea semaforului, partajata intre taskuri
+struct SemaphoreState {
+    Phase phase;
+    uint32_t phase_started_ms;
+    bool pedestrian_request;
+};
 
+// Mutexul protejeaza starea semaforului
+SemaphoreState semaphore_state;
+SemaphoreHandle_t state_mutex = nullptr;
+
+// Coada pentru apasarile butonului.
+// Fiecare element contine momentul sosirii (tick FreeRTOS).
+QueueHandle_t button_queue = nullptr;
 // TODO 1: TASK PERIODIC DE CONTROL, cu perioada CONTROL_PERIOD_MS.
 //   La fiecare job, cu mutexul luat, decide dacă faza curentă s-a terminat și
 //   trece în faza următoare, după tabelul din README.md:
@@ -57,7 +74,82 @@ const char* const LIGHT_NAMES[] = {"RED", "YELLOW", "GREEN"};
 //   mutexul, afișează pe Serial faza nouă, dacă s-a schimbat.
 //   Eliberările respectă grila r_k = r_0 + kT: așteptare absolută (xTaskDelayUntil).
 //   Durata unei faze se măsoară cu un timp monoton (millis()), nu cu epoch_ms().
+// TODO 1: TASK PERIODIC DE CONTROL
+void control_task(void* parameter) {
 
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(CONTROL_PERIOD_MS);
+
+    for (;;) {
+
+        bool phase_changed = false;
+        Phase new_phase;
+
+        // Luam mutexul si verificam starea
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+
+        uint32_t now = millis();
+        uint32_t elapsed = now - semaphore_state.phase_started_ms;
+
+        switch (semaphore_state.phase) {
+
+            case CAR_GREEN:
+                if (semaphore_state.pedestrian_request &&
+                    elapsed >= CAR_GREEN_MIN_MS) {
+
+                    semaphore_state.phase = CAR_YELLOW;
+                    phase_changed = true;
+                }
+                break;
+
+            case CAR_YELLOW:
+                if (elapsed >= CAR_YELLOW_MS) {
+
+                    semaphore_state.phase = ALL_RED;
+                    phase_changed = true;
+                }
+                break;
+
+            case ALL_RED:
+                if (elapsed >= ALL_RED_MS) {
+
+                    semaphore_state.phase = PED_GREEN;
+                    semaphore_state.pedestrian_request = false;
+                    phase_changed = true;
+                }
+                break;
+
+            case PED_GREEN:
+                if (elapsed >= PED_GREEN_MS) {
+
+                    semaphore_state.phase = CAR_GREEN;
+                    phase_changed = true;
+                }
+                break;
+        }
+
+        // Daca faza s-a schimbat, memoram momentul intrarii
+        if (phase_changed) {
+            semaphore_state.phase_started_ms = now;
+        }
+
+        new_phase = semaphore_state.phase;
+
+        // Eliberam mutexul inainte de Serial
+        xSemaphoreGive(state_mutex);
+
+        // Afisam doar daca faza s-a schimbat
+        if (phase_changed) {
+            Serial.printf(
+                "[control] Faza noua: %s\n",
+                PHASE_NAMES[new_phase]
+            );
+        }
+
+        // Asteptare periodica absoluta
+        xTaskDelayUntil(&last_wake, period);
+    }
+}
 // TODO 2: TASK PERIODIC DE IEȘIRE, cu perioada OUTPUT_PERIOD_MS.
 //   La fiecare job:
 //   - copiază starea (cu mutexul luat, cât mai scurt)
@@ -69,7 +161,94 @@ const char* const LIGHT_NAMES[] = {"RED", "YELLOW", "GREEN"};
 //   - aprinde LED-ul de pe placă (LED_PIN, aprins pe LOW) cât timp lampa
 //     AȘTEPTAȚI este aprinsă
 //   Așteptare absolută (xTaskDelayUntil), ca și la taskul de control.
+// TODO 2: TASK PERIODIC DE IESIRE
+void output_task(void* parameter) {
 
+    TickType_t last_wake = xTaskGetTickCount();
+
+    const TickType_t period = pdMS_TO_TICKS(OUTPUT_PERIOD_MS);
+
+    for (;;) {
+
+        // 1. Copiem starea protejata de mutex
+        SemaphoreState local_state;
+
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        local_state = semaphore_state;
+        xSemaphoreGive(state_mutex);
+
+        // 2. Stabilim culorile lampilor
+        Light car_light = RED;
+        Light pedestrian_light = RED;
+
+        switch (local_state.phase) {
+
+            case CAR_GREEN:
+                car_light = GREEN;
+                pedestrian_light = RED;
+                break;
+
+            case CAR_YELLOW:
+                car_light = YELLOW;
+                pedestrian_light = RED;
+                break;
+
+            case ALL_RED:
+                car_light = RED;
+                pedestrian_light = RED;
+                break;
+
+            case PED_GREEN:
+                car_light = RED;
+                pedestrian_light = GREEN;
+                break;
+        }
+
+        // 3. Calculam secundele ramase pentru pietoni
+        uint32_t seconds_remaining = 0;
+
+        if (local_state.phase == PED_GREEN) {
+
+            uint32_t elapsed = millis() - local_state.phase_started_ms;
+
+            uint32_t remaining_ms =
+                (elapsed >= PED_GREEN_MS)
+                ? 0
+                : PED_GREEN_MS - elapsed;
+
+            // Rotunjire in sus
+            seconds_remaining = (remaining_ms + 999) / 1000;
+        }
+
+        // 4. Construim mesajul MQTT
+        char message[160];
+
+        snprintf(
+            message,
+            sizeof(message),
+            "%s;%lld;%s;%s;%s;%d;%lu",
+            DEVICE_ID,
+            (long long)epoch_ms(),
+            PHASE_NAMES[local_state.phase],
+            LIGHT_NAMES[car_light],
+            LIGHT_NAMES[pedestrian_light],
+            local_state.pedestrian_request ? 1 : 0,
+            (unsigned long)seconds_remaining
+        );
+
+        // 5. Publicam mesajul
+        mqtt_publish("lights", message);
+
+        // 6. LED-ul placii: aprins pe LOW
+        digitalWrite(
+            LED_PIN,
+            local_state.pedestrian_request ? LOW : HIGH
+        );
+
+        // 7. Asteptare absoluta
+        xTaskDelayUntil(&last_wake, period);
+    }
+}
 // TODO 3: TASK SPORADIC, tratează apăsările butonului pentru pietoni.
 //   Apăsările vin din două surse, în aceeași coadă (coada butonului):
 //   - butonul BOOT de pe placă, printr-o rutină de întrerupere (ISR, mai jos)
@@ -85,21 +264,82 @@ const char* const LIGHT_NAMES[] = {"RED", "YELLOW", "GREEN"};
 //     și afișează pe Serial că a acceptat-o
 //   Momentul sosirii se ia când apăsarea intră în coadă (în ISR sau în
 //   command_received()), nu când o preia taskul, și se pune în elementul cozii.
+// TODO 3: TASK SPORADIC
+void sporadic_task(void* parameter) {
 
+    TickType_t arrival_time;
+    TickType_t last_accepted = 0;
+    bool has_last_accepted = false;
+
+    for (;;) {
+
+        // Asteptam o apasare in coada
+        if (xQueueReceive(button_queue, &arrival_time, portMAX_DELAY) == pdTRUE) {
+
+            // Verificam intervalul minim dintre apasari
+            TickType_t min_interval = pdMS_TO_TICKS(MIN_INTERARRIVAL_MS);
+
+            if (has_last_accepted &&
+                (TickType_t)(arrival_time - last_accepted) < min_interval) {
+
+                Serial.println("[button] Apasare respinsa: prea rapida!");
+                continue;
+            }
+
+            // Acceptam apasarea
+            last_accepted = arrival_time;
+            has_last_accepted = true;
+
+            // Inregistram cererea pietonului
+            xSemaphoreTake(state_mutex, portMAX_DELAY);
+
+            semaphore_state.pedestrian_request = true;
+
+            xSemaphoreGive(state_mutex);
+
+            Serial.println("[button] Cerere pieton acceptata!");
+        }
+    }
+}
 // TODO 3: RUTINA DE ÎNTRERUPERE a butonului BOOT, înregistrată în setup() cu
 //   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), button_isr, FALLING).
 //   Scurtă: pune o apăsare în coada butonului cu xQueueSendFromISR() și atât.
 //   Fără Serial, fără mqtt_publish(), fără mutex. Se declară cu IRAM_ATTR:
 //
 //   void IRAM_ATTR button_isr(void) { ... }
+// TODO 3: RUTINA DE INTRERUPERE
+void IRAM_ATTR button_isr(void) {
 
+    BaseType_t higher_priority_task_woken = pdFALSE;
+
+    TickType_t arrival_time = xTaskGetTickCountFromISR();
+
+    xQueueSendFromISR(
+        button_queue,
+        &arrival_time,
+        &higher_priority_task_woken
+    );
+
+    if (higher_priority_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
 // Apelată de clientul MQTT pentru fiecare comandă primită (vezi connection.h).
 void command_received(const char* text) {
     Serial.printf("[mqtt] comandă primită: %s\n", text);
     // TODO 3: "BUTTON" merge în coada butonului (o apăsare, la fel ca cea din
     //   ISR), fără să vă blocați (timeout 0). Celelalte comenzi se ignoră:
     //   în această temă placa nu are alte comenzi.
+    if (strcmp(text, "BUTTON") == 0) {
+
+        TickType_t arrival_time = xTaskGetTickCount();
+
+        if (xQueueSend(button_queue, &arrival_time, 0) != pdTRUE) {
+            Serial.println("[button] Coada este plina!");
+        }
+    }
 }
+
 
 void setup() {
     Serial.begin(115200);
@@ -124,13 +364,85 @@ void setup() {
     //   butonului (xQueueCreate). Înainte de mqtt_start(): de acolo încolo pot
     //   sosi comenzi, iar command_received() pune "BUTTON" în coadă.
     //   Notați și momentul intrării în faza inițială (CAR_GREEN).
+    // TODO 0 (a): Cream mutexul si coada
 
-    mqtt_start();
+    state_mutex = xSemaphoreCreateMutex();
+
+    button_queue = xQueueCreate(10, sizeof(TickType_t));
+
+    if (state_mutex == nullptr || button_queue == nullptr) {
+        Serial.println("Eroare la crearea mutexului sau cozii!");
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    // Initializam starea semaforului
+    semaphore_state.phase = CAR_GREEN;
+    semaphore_state.phase_started_ms = millis();
+    semaphore_state.pedestrian_request = false;
+
+    Serial.println("[init] Starea semaforului initializata: CAR_GREEN");
+        mqtt_start();
 
     // TODO 0 (b): porniți cele trei taskuri (xTaskCreate), apoi înregistrați
     //   întreruperea butonului (attachInterrupt). Alegeți prioritățile între
     //   2 și 19 (peste loopTask, sub taskurile sistemului); pentru cele două
     //   taskuri periodice, după regula Rate Monotonic. Stiva, în octeți: cel puțin 4096.
+    // Pornim temporar doar taskul de iesire.
+// Taskurile de control si buton vor fi adaugate ulterior.
+
+// Pornim temporar doar taskul de iesire.
+// Taskurile de control si buton vor fi adaugate ulterior.
+
+    // Pornim taskul de control
+BaseType_t control_result = xTaskCreate(
+    control_task,
+    "control",
+    4096,
+    nullptr,
+    4,
+    nullptr
+);
+
+if (control_result != pdPASS) {
+    Serial.println("[error] Nu s-a putut crea taskul control!");
+}
+
+// Pornim taskul de iesire
+    BaseType_t output_result = xTaskCreate(
+        output_task,
+        "output",
+        4096,
+        nullptr,
+        3,
+        nullptr
+    );
+
+    if (output_result != pdPASS) {
+        Serial.println("[error] Nu s-a putut crea taskul output!");
+    }
+    // Pornim taskul sporadic
+    BaseType_t sporadic_result = xTaskCreate(
+        sporadic_task,
+        "sporadic",
+        4096,
+        nullptr,
+        2,
+        nullptr
+    );
+
+    if (sporadic_result != pdPASS) {
+        Serial.println("[error] Nu s-a putut crea taskul sporadic!");
+    }
+
+    // Inregistram intreruperea butonului BOOT
+    attachInterrupt(
+        digitalPinToInterrupt(BUTTON_PIN),
+        button_isr,
+        FALLING
+    );
+
 }
 
 void loop() {
