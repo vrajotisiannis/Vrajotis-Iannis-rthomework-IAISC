@@ -29,6 +29,7 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <string.h>
+
 // Fazele semaforului (vezi tabelul și diagrama din README.md). Numele din
 // PHASE_NAMES sunt cele din mesajul "lights", în aceeași ordine ca în enum.
 enum Phase { CAR_GREEN, CAR_YELLOW, ALL_RED, PED_GREEN };
